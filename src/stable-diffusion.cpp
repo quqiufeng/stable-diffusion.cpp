@@ -4186,15 +4186,14 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         std::vector<int64_t> ipa_shape = {ctx_dim, static_cast<int64_t>(num_tokens)};
         sd::Tensor<float> ipa_tensor(ipa_shape);
 
-        // Fill: first 768 positions = IPAdapter tokens * weight, rest = 0
+        // IPAdapter tokens are already projected to ctx_dim (2560 for Z-Image).
+        // Copy all dimensions with weight scaling.
         // c_crossattn layout: data[row * stride + col] where stride=orig_tokens (dim 1)
         // IPA tensor layout:   data[row * stride + col] where stride=num_tokens (dim 1)
         // row=ctx_dim index, col=token index
-        int cols_to_copy = std::min(768, static_cast<int>(ctx_dim));
         for (int i = 0; i < num_tokens; i++) {
-            for (int j = 0; j < cols_to_copy; j++) {
-                // j is ctx_dim index, i is token index
-                ipa_tensor.data()[j * num_tokens + i] = tokens_ptr[i * 768 + j] * weight;
+            for (int j = 0; j < ctx_dim; j++) {
+                ipa_tensor.data()[j * num_tokens + i] = tokens_ptr[i * ctx_dim + j] * weight;
             }
         }
 
