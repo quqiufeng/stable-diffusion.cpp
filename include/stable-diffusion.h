@@ -393,6 +393,10 @@ typedef struct {
     sd_freeu_params_t freeu;
     sd_sag_params_t sag;
     sd_dynamic_cfg_params_t dynamic_cfg;
+    // IPAdapter: image prompt tokens
+    const float* ipadapter_tokens;      // [N * 768] image tokens from CLIP Vision + IPAdapter MLP, NULL = disabled
+    int ipadapter_num_tokens;           // N (number of image token vectors)
+    float ipadapter_weight;             // scale factor applied to tokens (0.0-1.0)
 } sd_img_gen_params_t;
 
 typedef struct {

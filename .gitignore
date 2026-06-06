@@ -13,4 +13,3 @@ output*.png
 models*
 *.log
 preview.png
-bin/
