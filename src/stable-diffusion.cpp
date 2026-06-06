@@ -1952,8 +1952,11 @@ public:
                              float vace_strength,
                              int audio_length,
                              float frame_rate,
-                             const sd_cache_params_t* cache_params,
-                             const sd::Tensor<float>& video_positions = {}) {
+                              const sd_cache_params_t* cache_params,
+                              const sd::Tensor<float>& video_positions = {},
+                              int ipa_orig_tokens  = 0,
+                              int ipa_start_step   = 0,
+                              int ipa_end_step     = 0) {
         std::vector<int> skip_layers(guidance.slg.layers, guidance.slg.layers + guidance.slg.layer_count);
         float cfg_scale     = guidance.txt_cfg;
         float img_cfg_scale = guidance.img_cfg;
@@ -2135,8 +2138,18 @@ public:
                 return output_opt;
             };
 
+            SDCondition cond_for_step = cond;
+            if (ipa_orig_tokens > 0 && (step < ipa_start_step || step >= ipa_end_step)) {
+                // Step is outside IPA active range: remove IPA tokens from conditioning
+                if (cond_for_step.c_crossattn.shape()[1] > ipa_orig_tokens) {
+                    cond_for_step.c_crossattn = sd::ops::slice(cond_for_step.c_crossattn, 1, 0, ipa_orig_tokens);
+                    LOG_DEBUG("IPAdapter: step %d outside [%d,%d), removed %lld IPA tokens",
+                              step, ipa_start_step, ipa_end_step,
+                              (long long)(cond.c_crossattn.shape()[1] - ipa_orig_tokens));
+                }
+            }
             if (start_merge_step == -1 || step <= start_merge_step) {
-                cond_out = run_condition(cond);
+                cond_out = run_condition(cond_for_step);
                 if (cond_out.empty()) {
                     return {};
                 }
@@ -2162,7 +2175,13 @@ public:
                     LOG_DEBUG("Skipping layers at uncond step %d\n", step);
                     uncond_skip_layers = &skip_layer_guidance.layers();
                 }
-                uncond_out = run_condition(uncond, nullptr, uncond_skip_layers);
+                SDCondition uncond_for_step = uncond;
+                if (ipa_orig_tokens > 0 && (step < ipa_start_step || step >= ipa_end_step)) {
+                    if (uncond_for_step.c_crossattn.shape()[1] > ipa_orig_tokens) {
+                        uncond_for_step.c_crossattn = sd::ops::slice(uncond_for_step.c_crossattn, 1, 0, ipa_orig_tokens);
+                    }
+                }
+                uncond_out = run_condition(uncond_for_step, nullptr, uncond_skip_layers);
                 if (uncond_out.empty()) {
                     return {};
                 }
@@ -3831,6 +3850,13 @@ struct ImageGenerationEmbeds {
     SDCondition uncond;
     SDCondition img_cond;
     SDCondition id_cond;
+    // IPAdapter step control: number of tokens before IPA injection
+    // c_crossattn shape = [ctx_dim, ipa_orig_tokens + num_ipa_tokens]
+    // If step is outside [ipa_start_step, ipa_end_step), slice c_crossattn
+    // along dim 1 to [0, ipa_orig_tokens) to remove IPA tokens.
+    int ipa_orig_tokens    = 0;  // tokens before IPA injection (0 = no IPA active)
+    int ipa_start_step     = 0;
+    int ipa_end_step       = 0;
 };
 
 struct CircularAxesState {
@@ -4161,16 +4187,20 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     }
 
     int64_t t1 = ggml_time_ms();
-    LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
+        LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
     // IPAdapter: inject image tokens into conditioning
+    // Record original token count before injection for step control
+    int64_t ipa_orig_tokens = 0;
     if (sd_img_gen_params->ipadapter_tokens != nullptr &&
         sd_img_gen_params->ipadapter_num_tokens > 0 &&
         !cond.c_crossattn.empty()) {
+
+        ipa_orig_tokens = cond.c_crossattn.shape()[1];  // tokens before IPA
 
         int num_tokens     = sd_img_gen_params->ipadapter_num_tokens;
         float weight       = sd_img_gen_params->ipadapter_weight;
@@ -4180,7 +4210,7 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         // e.g. Z-Image: [2560, 9] — dim0=ctx_dim, dim1=token_idx
         auto c_shape        = cond.c_crossattn.shape();
         int64_t ctx_dim     = c_shape[0];  // Z-Image: 2560
-        int64_t orig_tokens = c_shape[1];  // e.g. 9 text tokens
+        int64_t total_tokens_before = c_shape[1];  // e.g. 9 text tokens
 
         // Create IPA tensor with same layout [ctx_dim, num_ipa_tokens]
         std::vector<int64_t> ipa_shape = {ctx_dim, static_cast<int64_t>(num_tokens)};
@@ -4188,9 +4218,6 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
 
         // IPAdapter tokens are already projected to ctx_dim (2560 for Z-Image).
         // Copy all dimensions with weight scaling.
-        // c_crossattn layout: data[row * stride + col] where stride=orig_tokens (dim 1)
-        // IPA tensor layout:   data[row * stride + col] where stride=num_tokens (dim 1)
-        // row=ctx_dim index, col=token index
         for (int i = 0; i < num_tokens; i++) {
             for (int j = 0; j < ctx_dim; j++) {
                 ipa_tensor.data()[j * num_tokens + i] = tokens_ptr[i * ctx_dim + j] * weight;
@@ -4210,6 +4237,18 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
                  sd::tensor_shape_to_string(cond.c_crossattn.shape()).c_str());
     }
 
+    // Compute IPAdapter step control from ratios
+    int ipa_start_step = 0;
+    int ipa_end_step   = 0;
+    if (ipa_orig_tokens > 0 && plan != nullptr && plan->sample_steps > 0) {
+        float start_ratio = sd_img_gen_params->ipadapter_start_at;
+        float end_ratio   = sd_img_gen_params->ipadapter_end_at;
+        ipa_start_step    = (int)(start_ratio * plan->sample_steps);
+        ipa_end_step      = (int)(end_ratio * plan->sample_steps);
+        LOG_INFO("IPAdapter: step control active, start=%d end=%d (total steps=%d, ratios=%.2f/%.2f)",
+                 ipa_start_step, ipa_end_step, plan->sample_steps, start_ratio, end_ratio);
+    }
+
     ImageGenerationEmbeds embeds;
     if (request->use_img_cond) {
         embeds.img_cond = SDCondition(uncond.c_crossattn, uncond.c_vector, cond.c_concat);
@@ -4217,6 +4256,9 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     embeds.cond    = std::move(cond);
     embeds.uncond  = std::move(uncond);
     embeds.id_cond = std::move(id_cond);
+    embeds.ipa_orig_tokens  = (int)ipa_orig_tokens;
+    embeds.ipa_start_step   = ipa_start_step;
+    embeds.ipa_end_step     = ipa_end_step;
 
     return embeds;
 }
@@ -4531,8 +4573,12 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
                                                    sd::Tensor<float>(),
                                                    1.f,
                                                    0,
-                                                   static_cast<float>(request.fps),
-                                                   request.cache_params);
+                                                    static_cast<float>(request.fps),
+                                                    request.cache_params,
+                                                    {},  // video_positions (unused)
+                                                    embeds.ipa_orig_tokens,
+                                                    embeds.ipa_start_step,
+                                                    embeds.ipa_end_step);
         int64_t sampling_end  = ggml_time_ms();
         if (!x_0.empty()) {
             LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);

@@ -67,6 +67,12 @@ struct DiffusionParams {
     const std::vector<sd::Tensor<float>>* ref_latents = nullptr;
     bool increase_ref_index                           = false;
     DiffusionExtraParams extra                        = std::monostate{};
+    // FreeU parameters (local addition, not in upstream)
+    bool freeu_enabled = false;
+    float freeu_b1 = 1.3f;
+    float freeu_b2 = 1.4f;
+    float freeu_s1 = 0.9f;
+    float freeu_s2 = 0.2f;
 };
 
 template <typename T>

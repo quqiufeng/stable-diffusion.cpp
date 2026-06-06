@@ -397,6 +397,8 @@ typedef struct {
     const float* ipadapter_tokens;      // [N * 768] image tokens from CLIP Vision + IPAdapter MLP, NULL = disabled
     int ipadapter_num_tokens;           // N (number of image token vectors)
     float ipadapter_weight;             // scale factor applied to tokens (0.0-1.0)
+    float ipadapter_start_at;           // step control: fraction of total steps to start (0.0 = first step)
+    float ipadapter_end_at;             // step control: fraction of total steps to end (1.0 = last step)
 } sd_img_gen_params_t;
 
 typedef struct {
