@@ -273,6 +273,12 @@ public:
     }
 };
 
+// IPAdapter UNet injection globals (defined in stable-diffusion.cpp)
+extern bool g_ipadapter_unet_enabled;
+extern int g_ipadapter_unet_counter;
+extern thread_local ggml_tensor* g_ipadapter_image_embeds;
+extern ggml_tensor* g_ipadapter_image_embeds_tensor;
+
 class CrossAttention : public GGMLBlock {
 protected:
     int64_t query_dim;
@@ -280,6 +286,7 @@ protected:
     int64_t n_head;
     int64_t d_head;
     bool xtra_dim = false;
+    int ipadapter_idx = -1;
 
 public:
     CrossAttention(int64_t query_dim,
@@ -302,6 +309,21 @@ public:
 
         blocks["to_out.0"] = std::shared_ptr<GGMLBlock>(new Linear(inner_dim, query_dim));
         // to_out_1 is nn.Dropout(), skip for inference
+
+        // IPAdapter Plus UNet injection: only for SDXL cross-attention (context_dim == 2048).
+        // The layer_id follows the flattened attention index (self+cross) so it matches the
+        // trained weight file: cross-attention layers sit at odd indices 1,3,...,139.
+        if (g_ipadapter_unet_enabled) {
+            int layer_id = g_ipadapter_unet_counter;
+            if (context_dim == 2048) {
+                ipadapter_idx = layer_id;
+                std::string k_name = "to_k_ip_layer_" + std::to_string(layer_id);
+                std::string v_name = "to_v_ip_layer_" + std::to_string(layer_id);
+                blocks[k_name] = std::shared_ptr<GGMLBlock>(new Linear(2048, inner_dim, false));
+                blocks[v_name] = std::shared_ptr<GGMLBlock>(new Linear(2048, inner_dim, false));
+            }
+            ++g_ipadapter_unet_counter;
+        }
     }
 
     ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -330,6 +352,28 @@ public:
         if (xtra_dim) {
             context->ne[0] = 320;  // reset dim to orig
         }
+
+        // IPAdapter UNet cross-attention injection
+        if (g_ipadapter_image_embeds != nullptr && ipadapter_idx >= 0) {
+            std::string k_name = "to_k_ip_layer_" + std::to_string(ipadapter_idx);
+            std::string v_name = "to_v_ip_layer_" + std::to_string(ipadapter_idx);
+            if (!blocks.count(k_name) || !blocks.count(v_name)) {
+                LOG_WARN("CrossAttention layer %d missing IPAdapter blocks", ipadapter_idx);
+            } else {
+                auto to_k_ip = std::dynamic_pointer_cast<Linear>(blocks[k_name]);
+                auto to_v_ip = std::dynamic_pointer_cast<Linear>(blocks[v_name]);
+                auto k_ip = to_k_ip->forward(ctx, g_ipadapter_image_embeds);  // [1, N_ip, inner_dim]
+                auto v_ip = to_v_ip->forward(ctx, g_ipadapter_image_embeds);  // [1, N_ip, inner_dim]
+                // Repeat along batch dim if needed
+                if (k_ip->ne[2] != k->ne[2]) {
+                    k_ip = ggml_repeat(ctx->ggml_ctx, k_ip, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, k_ip->ne[0], k_ip->ne[1], k->ne[2]));
+                    v_ip = ggml_repeat(ctx->ggml_ctx, v_ip, ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F32, v_ip->ne[0], v_ip->ne[1], k->ne[2]));
+                }
+                k = ggml_concat(ctx->ggml_ctx, k, k_ip, 1);  // concat along token dim
+                v = ggml_concat(ctx->ggml_ctx, v, v_ip, 1);
+            }
+        }
+
         x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, nullptr, false, ctx->flash_attn_enabled);  // [N, n_token, inner_dim]
 
         x = to_out_0->forward(ctx, x);  // [N, n_token, query_dim]

@@ -609,6 +609,13 @@ struct UNetModelRunner : public DiffusionModelRunner {
                     const std::string prefix,
                     SDVersion version = VERSION_SD1)
         : DiffusionModelRunner(backend, params_backend, prefix), unet(version, tensor_storage_map) {
+        // Reserve IPAdapter image_embeds tensor in params_ctx so it shares the params buffer
+        if (g_ipadapter_unet_enabled) {
+            g_ipadapter_image_embeds_tensor = ggml_new_tensor_3d(params_ctx, GGML_TYPE_F32, 2048, 16, 1);
+            if (g_ipadapter_image_embeds_tensor != nullptr) {
+                ggml_set_name(g_ipadapter_image_embeds_tensor, "ipadapter_image_embeds");
+            }
+        }
         unet.init(params_ctx, tensor_storage_map, prefix);
     }
 

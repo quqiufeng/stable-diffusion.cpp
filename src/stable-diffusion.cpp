@@ -47,6 +47,182 @@
 const char* sd_vae_format_name(enum sd_vae_format_t format);
 static SDVersion sd_vae_format_to_version(enum sd_vae_format_t format, SDVersion fallback);
 
+// =============================================================================
+// IPAdapter UNet cross-attention injection support
+// =============================================================================
+struct IPAdapterUNetLayerWeight {
+    int layer_id;
+    int out_features;
+    int in_features;
+    std::vector<float> to_k_ip;
+    std::vector<float> to_v_ip;
+};
+
+static std::vector<IPAdapterUNetLayerWeight> g_ipadapter_unet_weights;
+bool g_ipadapter_unet_enabled = false;
+int g_ipadapter_unet_counter = 0;
+thread_local ggml_tensor* g_ipadapter_image_embeds = nullptr;
+ggml_tensor* g_ipadapter_image_embeds_tensor = nullptr;
+
+static bool load_ipadapter_unet_weights(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        LOG_ERROR("ipadapter_unet_weights_path is empty");
+        return false;
+    }
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        LOG_ERROR("Failed to open ipadapter_unet_weights: %s", path);
+        return false;
+    }
+    auto close_file = [f]() { fclose(f); };
+
+    uint32_t n_layers = 0, version = 0;
+    if (fread(&n_layers, sizeof(n_layers), 1, f) != 1 ||
+        fread(&version, sizeof(version), 1, f) != 1) {
+        LOG_ERROR("Failed to read ipadapter_unet_weights header");
+        return false;
+    }
+    LOG_INFO("Loading %u IPAdapter UNet layers from %s (version=%u)", n_layers, path, version);
+
+    g_ipadapter_unet_weights.clear();
+    g_ipadapter_unet_weights.reserve(n_layers);
+
+    auto read_layer = [&](bool has_layer_id) -> bool {
+        IPAdapterUNetLayerWeight w;
+        if (has_layer_id) {
+            if (fread(&w.layer_id, sizeof(w.layer_id), 1, f) != 1) return false;
+        } else {
+            // First layer has no explicit layer_id for backward compatibility;
+            // it corresponds to the first injected cross-attention layer.
+            w.layer_id = 1;
+        }
+        if (fread(&w.out_features, sizeof(w.out_features), 1, f) != 1) return false;
+        if (fread(&w.in_features, sizeof(w.in_features), 1, f) != 1) return false;
+        size_t mat_size = (size_t)w.out_features * (size_t)w.in_features;
+        w.to_k_ip.resize(mat_size);
+        w.to_v_ip.resize(mat_size);
+        if (fread(w.to_k_ip.data(), sizeof(float), mat_size, f) != mat_size) return false;
+        if (fread(w.to_v_ip.data(), sizeof(float), mat_size, f) != mat_size) return false;
+        g_ipadapter_unet_weights.push_back(std::move(w));
+        return true;
+    };
+
+    // Layer 0 has no layer_id for backward compatibility with the first export format
+    if (!read_layer(false)) {
+        LOG_ERROR("Failed to read IPAdapter UNet layer 0");
+        return false;
+    }
+    for (uint32_t i = 1; i < n_layers; ++i) {
+        if (!read_layer(true)) {
+            LOG_ERROR("Failed to read IPAdapter UNet layer %u", i);
+            return false;
+        }
+    }
+
+    fclose(f);
+    LOG_INFO("Loaded %zu IPAdapter UNet layer weights", g_ipadapter_unet_weights.size());
+    return true;
+}
+
+static int parse_ipadapter_layer_id(const std::string& key) {
+    // Expect key like "...attn2.to_k_ip_layer_123.weight"
+    size_t pos = key.find("to_k_ip_layer_");
+    if (pos == std::string::npos) {
+        pos = key.find("to_v_ip_layer_");
+    }
+    if (pos == std::string::npos) return -1;
+    pos += std::string("to_k_ip_layer_").length();
+    size_t end = key.find('.', pos);
+    if (end == std::string::npos) end = key.length();
+    try {
+        return std::stoi(key.substr(pos, end - pos));
+    } catch (...) {
+        return -1;
+    }
+}
+
+static void assign_ipadapter_unet_weights(const std::map<std::string, ggml_tensor*>& params_map) {
+    if (!g_ipadapter_unet_enabled || g_ipadapter_unet_weights.empty()) return;
+
+    // Build map from layer_id -> (k_tensor, v_tensor)
+    std::map<int, std::pair<ggml_tensor*, ggml_tensor*>> tensor_pairs_by_id;
+    for (auto& kv : params_map) {
+        int layer_id = parse_ipadapter_layer_id(kv.first);
+        if (layer_id < 0) continue;
+        if (kv.first.find("to_k_ip_layer_") != std::string::npos) {
+            tensor_pairs_by_id[layer_id].first = kv.second;
+        } else if (kv.first.find("to_v_ip_layer_") != std::string::npos) {
+            tensor_pairs_by_id[layer_id].second = kv.second;
+        }
+    }
+
+    if (tensor_pairs_by_id.size() != g_ipadapter_unet_weights.size()) {
+        LOG_WARN("IPAdapter UNet weight count mismatch: weights=%zu, tensor_pairs=%zu",
+                 g_ipadapter_unet_weights.size(), tensor_pairs_by_id.size());
+    }
+
+    // Group file weights and model tensors by shape so a layer_id mismatch in
+    // the weight file does not prevent correct assignment.  Within each shape
+    // we match by sorted layer_id/name order.
+    struct WeightWithId {
+        const IPAdapterUNetLayerWeight* w;
+        int layer_id;
+    };
+    struct TensorPairWithId {
+        std::pair<ggml_tensor*, ggml_tensor*> pair;
+        int layer_id;
+    };
+    std::map<size_t, std::vector<WeightWithId>> weights_by_shape;
+    std::map<size_t, std::vector<TensorPairWithId>> tensors_by_shape;
+
+    for (auto& w : g_ipadapter_unet_weights) {
+        size_t expected = w.to_k_ip.size() * sizeof(float);
+        weights_by_shape[expected].push_back({&w, w.layer_id});
+    }
+    for (auto& kv : tensor_pairs_by_id) {
+        auto* k_w = kv.second.first;
+        auto* v_w = kv.second.second;
+        if (k_w == nullptr || v_w == nullptr) continue;
+        size_t k_bytes = ggml_nbytes(k_w);
+        tensors_by_shape[k_bytes].push_back({{k_w, v_w}, kv.first});
+    }
+
+    for (auto& s : weights_by_shape) {
+        auto& wvec = s.second;
+        auto it    = tensors_by_shape.find(s.first);
+        if (it == tensors_by_shape.end()) {
+            LOG_WARN("IPAdapter UNet: no model tensors with size %zu", s.first);
+            continue;
+        }
+        auto& tvec = it->second;
+        if (wvec.size() != tvec.size()) {
+            LOG_WARN("IPAdapter UNet: shape group size %zu mismatch: weights=%zu tensors=%zu",
+                     s.first, wvec.size(), tvec.size());
+        }
+        std::sort(wvec.begin(), wvec.end(), [](auto& a, auto& b) { return a.layer_id < b.layer_id; });
+        std::sort(tvec.begin(), tvec.end(), [](auto& a, auto& b) { return a.layer_id < b.layer_id; });
+    }
+
+    size_t assigned = 0;
+    for (auto& s : weights_by_shape) {
+        auto it = tensors_by_shape.find(s.first);
+        if (it == tensors_by_shape.end()) continue;
+        auto& wvec = s.second;
+        auto& tvec = it->second;
+        size_t n   = std::min(wvec.size(), tvec.size());
+        for (size_t i = 0; i < n; ++i) {
+            auto& w    = *wvec[i].w;
+            auto* k_w  = tvec[i].pair.first;
+            auto* v_w  = tvec[i].pair.second;
+            ggml_backend_tensor_set(k_w, w.to_k_ip.data(), 0, s.first);
+            ggml_backend_tensor_set(v_w, w.to_v_ip.data(), 0, s.first);
+            ++assigned;
+        }
+    }
+    LOG_INFO("Assigned IPAdapter UNet weights to %zu/%zu cross-attention layers",
+             assigned, g_ipadapter_unet_weights.size());
+}
+
 const char* model_version_to_str[] = {
     "SD 1.x",
     "SD 1.x Inpaint",
@@ -392,8 +568,15 @@ public:
 
         version = model_loader.get_sd_version();
         if (version == VERSION_COUNT) {
-            LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
-            return false;
+            // Fallback: if both clip_l and clip_g are provided, assume SDXL
+            if (strlen(SAFE_STR(sd_ctx_params->clip_l_path)) > 0 &&
+                strlen(SAFE_STR(sd_ctx_params->clip_g_path)) > 0) {
+                LOG_WARN("get sd version from file failed, but clip_l and clip_g provided, assuming SDXL");
+                version = VERSION_SDXL;
+            } else {
+                LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+                return false;
+            }
         }
 
         auto& tensor_storage_map = model_loader.get_tensor_storage_map();
@@ -475,10 +658,16 @@ public:
                     backend_manager.runtime_backend_supports_host_buffer(module));
         };
 
+        auto is_ipadapter_unet_param = [](const std::string& key) -> bool {
+            return key.find("attn2.to_k_ip_layer_") != std::string::npos ||
+                   key.find("attn2.to_v_ip_layer_") != std::string::npos;
+        };
+
         auto get_param_tensors_p = [&](auto&& model, bool do_mmap, const char* prefix) {
             std::map<std::string, ggml_tensor*> temp;
             model->get_param_tensors(temp, prefix);
             for (const auto& [key, tensor] : temp) {
+                if (is_ipadapter_unet_param(key)) continue;
                 tensors[key] = tensor;
                 if (do_mmap) {
                     mmap_able_tensors[key] = tensor;
@@ -490,6 +679,7 @@ public:
             std::map<std::string, ggml_tensor*> temp;
             model->get_param_tensors(temp);
             for (const auto& [key, tensor] : temp) {
+                if (is_ipadapter_unet_param(key)) continue;
                 tensors[key] = tensor;
                 if (do_mmap) {
                     mmap_able_tensors[key] = tensor;
@@ -726,6 +916,17 @@ public:
                                                                                            embbeding_map,
                                                                                            version);
                 }
+
+                // Enable IPAdapter UNet cross-attention injection before constructing UNet
+                if (sd_ctx_params->ipadapter_unet_mode && strlen(SAFE_STR(sd_ctx_params->ipadapter_unet_weights_path)) > 0) {
+                    g_ipadapter_unet_enabled = true;
+                    g_ipadapter_unet_counter = 0;
+                    if (!load_ipadapter_unet_weights(sd_ctx_params->ipadapter_unet_weights_path)) {
+                        LOG_ERROR("Failed to load IPAdapter UNet weights, disabling UNet mode");
+                        g_ipadapter_unet_enabled = false;
+                    }
+                }
+
                 diffusion_model = std::make_shared<UNetModelRunner>(backend_for(SDBackendModule::DIFFUSION),
                                                                     params_backend_for(SDBackendModule::DIFFUSION),
                                                                     tensor_storage_map,
@@ -1074,6 +1275,13 @@ public:
         }
 
         LOG_DEBUG("finished loaded file");
+
+        // Assign IPAdapter UNet weights after all params buffers are allocated
+        if (g_ipadapter_unet_enabled && diffusion_model) {
+            std::map<std::string, ggml_tensor*> ipadapter_unet_tensors;
+            diffusion_model->get_param_tensors(ipadapter_unet_tensors);
+            assign_ipadapter_unet_weights(ipadapter_unet_tensors);
+        }
 
         {
             size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
@@ -2757,6 +2965,8 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->vae_format              = SD_VAE_FORMAT_AUTO;
     sd_ctx_params->backend                 = nullptr;
     sd_ctx_params->params_backend          = nullptr;
+    sd_ctx_params->ipadapter_unet_mode     = false;
+    sd_ctx_params->ipadapter_unet_weights_path = nullptr;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -3857,6 +4067,11 @@ struct ImageGenerationEmbeds {
     int ipa_orig_tokens    = 0;  // tokens before IPA injection (0 = no IPA active)
     int ipa_start_step     = 0;
     int ipa_end_step       = 0;
+
+    // For UNet cross-attention IPAdapter injection (alternative to context concat)
+    const float* ipadapter_tokens     = nullptr;
+    int ipadapter_num_tokens          = 0;
+    float ipadapter_weight            = 1.0f;
 };
 
 struct CircularAxesState {
@@ -4193,10 +4408,12 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         sd_ctx->sd->cond_stage_model->free_params_buffer();
     }
 
-    // IPAdapter: inject image tokens into conditioning
-    // Record original token count before injection for step control
+    // IPAdapter: inject image tokens into conditioning (DiT context concat mode)
+    // For UNet cross-attention mode, tokens are passed via persistent tensor instead.
+    // Record original token count before injection for step control.
     int64_t ipa_orig_tokens = 0;
-    if (sd_img_gen_params->ipadapter_tokens != nullptr &&
+    if (!sd_img_gen_params->ipadapter_unet_mode &&
+        sd_img_gen_params->ipadapter_tokens != nullptr &&
         sd_img_gen_params->ipadapter_num_tokens > 0 &&
         !cond.c_crossattn.empty()) {
 
@@ -4207,7 +4424,6 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         const float* tokens_ptr = sd_img_gen_params->ipadapter_tokens;
 
         // c_crossattn is 2D: [ctx_dim, num_text_tokens]
-        // e.g. Z-Image: [2560, 9] — dim0=ctx_dim, dim1=token_idx
         auto c_shape        = cond.c_crossattn.shape();
         int64_t ctx_dim     = c_shape[0];  // Z-Image: 2560
         int64_t total_tokens_before = c_shape[1];  // e.g. 9 text tokens
@@ -4216,8 +4432,7 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
         std::vector<int64_t> ipa_shape = {ctx_dim, static_cast<int64_t>(num_tokens)};
         sd::Tensor<float> ipa_tensor(ipa_shape);
 
-        // IPAdapter tokens are already projected to ctx_dim (2560 for Z-Image).
-        // Copy all dimensions with weight scaling.
+        // Copy tokens with weight scaling
         for (int i = 0; i < num_tokens; i++) {
             for (int j = 0; j < ctx_dim; j++) {
                 ipa_tensor.data()[j * num_tokens + i] = tokens_ptr[i * ctx_dim + j] * weight;
@@ -4259,6 +4474,15 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
     embeds.ipa_orig_tokens  = (int)ipa_orig_tokens;
     embeds.ipa_start_step   = ipa_start_step;
     embeds.ipa_end_step     = ipa_end_step;
+
+    // Save IPAdapter tokens for UNet cross-attention injection mode
+    if (sd_img_gen_params->ipadapter_unet_mode &&
+        sd_img_gen_params->ipadapter_tokens != nullptr &&
+        sd_img_gen_params->ipadapter_num_tokens > 0) {
+        embeds.ipadapter_tokens     = sd_img_gen_params->ipadapter_tokens;
+        embeds.ipadapter_num_tokens = sd_img_gen_params->ipadapter_num_tokens;
+        embeds.ipadapter_weight     = sd_img_gen_params->ipadapter_weight;
+    }
 
     return embeds;
 }
@@ -4537,6 +4761,26 @@ SD_API sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* s
         return nullptr;
     }
     ImageGenerationEmbeds embeds = std::move(*embeds_opt);
+
+    // Set up IPAdapter UNet image_embeds tensor for cross-attention injection
+    if (g_ipadapter_image_embeds_tensor != nullptr && embeds.ipadapter_tokens != nullptr && embeds.ipadapter_num_tokens > 0) {
+        int n_tokens    = embeds.ipadapter_num_tokens;
+        int ctx_dim     = (int)g_ipadapter_image_embeds_tensor->ne[0];
+        size_t num_floats = (size_t)n_tokens * ctx_dim;
+        std::vector<float> scaled(num_floats);
+        const float* src = embeds.ipadapter_tokens;
+        float weight     = embeds.ipadapter_weight;
+        for (int i = 0; i < n_tokens; i++) {
+            for (int j = 0; j < ctx_dim; j++) {
+                scaled[i * ctx_dim + j] = src[i * ctx_dim + j] * weight;
+            }
+        }
+        ggml_backend_tensor_set(g_ipadapter_image_embeds_tensor, scaled.data(), 0, num_floats * sizeof(float));
+        g_ipadapter_image_embeds = g_ipadapter_image_embeds_tensor;
+        LOG_INFO("IPAdapter UNet: set image_embeds tensor [1, %d, %d] with weight=%.2f", n_tokens, ctx_dim, weight);
+    } else {
+        g_ipadapter_image_embeds = nullptr;
+    }
 
     std::vector<sd::Tensor<float>> final_latents;
     int64_t denoise_start = ggml_time_ms();

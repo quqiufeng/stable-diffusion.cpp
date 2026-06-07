@@ -224,6 +224,9 @@ typedef struct {
     float max_vram;  // GiB budget for graph-cut segmented param offload (0 = disabled, -1 = auto free VRAM minus 1 GiB)
     const char* backend;
     const char* params_backend;
+    // IPAdapter UNet cross-attention injection (SDXL)
+    bool ipadapter_unet_mode;           // true = inject image tokens into UNet cross-attention
+    const char* ipadapter_unet_weights_path;  // path to ipadapter_unet_weights.bin
 } sd_ctx_params_t;
 
 typedef struct {
@@ -394,11 +397,14 @@ typedef struct {
     sd_sag_params_t sag;
     sd_dynamic_cfg_params_t dynamic_cfg;
     // IPAdapter: image prompt tokens
-    const float* ipadapter_tokens;      // [N * 768] image tokens from CLIP Vision + IPAdapter MLP, NULL = disabled
+    const float* ipadapter_tokens;      // [N * 768 or N * 2048] image tokens from CLIP Vision + IPAdapter MLP, NULL = disabled
     int ipadapter_num_tokens;           // N (number of image token vectors)
     float ipadapter_weight;             // scale factor applied to tokens (0.0-1.0)
     float ipadapter_start_at;           // step control: fraction of total steps to start (0.0 = first step)
     float ipadapter_end_at;             // step control: fraction of total steps to end (1.0 = last step)
+    // IPAdapter for UNet (SDXL): use cross-attention k/v injection instead of context concat
+    bool ipadapter_unet_mode;           // true = UNet cross-attention injection (SDXL), false = DiT context concat (Z-Image)
+    const char* ipadapter_unet_weights_path;  // path to ipadapter_unet_weights.bin (for UNet mode)
 } sd_img_gen_params_t;
 
 typedef struct {

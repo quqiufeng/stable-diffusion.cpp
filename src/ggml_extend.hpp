@@ -2601,8 +2601,11 @@ protected:
         return output;
     }
 
-public:
+ public:
     virtual std::string get_desc() = 0;
+
+    ggml_context* get_params_ctx() const { return params_ctx; }
+    ggml_backend_t get_params_backend() const { return params_backend; }
 
     GGMLRunner(ggml_backend_t backend, ggml_backend_t params_backend)
         : params_backend(params_backend),
