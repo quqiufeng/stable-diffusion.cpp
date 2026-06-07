@@ -176,6 +176,20 @@ public:
             float tile_overlap;
             int tile_size_x, tile_size_y;
             get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, input.shape()[0], input.shape()[1]);
+
+            // Cap output tile size to prevent OOM on consumer GPUs
+            // 1280x768 decode needs ~6GB buffer; cap at ~1024 output to stay under ~7GB per tile
+            const int max_output_tile = 1024;
+            int output_tile_x         = tile_size_x * scale_factor;
+            int output_tile_y         = tile_size_y * scale_factor;
+            if (output_tile_x > max_output_tile || output_tile_y > max_output_tile) {
+                float scale   = (float)max_output_tile / std::max(output_tile_x, output_tile_y);
+                tile_size_x   = std::max(4, (int)(tile_size_x * scale));
+                tile_size_y   = std::max(4, (int)(tile_size_y * scale));
+                tile_size_x   = std::min(tile_size_x, (int)input.shape()[0]);
+                tile_size_y   = std::min(tile_size_y, (int)input.shape()[1]);
+            }
+
             if (!silent) {
                 LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             }

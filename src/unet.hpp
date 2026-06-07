@@ -185,6 +185,19 @@ protected:
 public:
     int model_channels  = 320;
     int adm_in_channels = 2816;  // only for VERSION_SDXL/SVD
+    bool freeu_enabled  = false;
+    float freeu_b1      = 1.3f;
+    float freeu_b2      = 1.4f;
+    float freeu_s1      = 0.9f;
+    float freeu_s2      = 0.2f;
+
+    void set_freeu(bool enabled, float b1, float b2, float s1, float s2) {
+        freeu_enabled = enabled;
+        freeu_b1      = b1;
+        freeu_b2      = b2;
+        freeu_s1      = s1;
+        freeu_s2      = s2;
+    }
 
     UnetModelBlock(SDVersion version = VERSION_SD1, const String2TensorStorage& tensor_storage_map = {})
         : version(version) {
@@ -556,6 +569,14 @@ public:
                     control_offset--;
                 }
 
+                if (freeu_enabled) {
+                    // FreeU: boost backbone, reduce skip connection
+                    float b = (output_block_idx < 3) ? freeu_b1 : freeu_b2;
+                    float s = (output_block_idx < 3) ? freeu_s1 : freeu_s2;
+                    h      = ggml_scale(ctx->ggml_ctx, h, b);
+                    h_skip = ggml_scale(ctx->ggml_ctx, h_skip, s);
+                }
+
                 h = ggml_concat(ctx->ggml_ctx, h, h_skip, 2);
 
                 std::string name = "output_blocks." + std::to_string(output_block_idx) + ".0";
@@ -694,6 +715,11 @@ struct UNetModelRunner : public DiffusionModelRunner {
                               const DiffusionParams& diffusion_params) override {
         GGML_ASSERT(diffusion_params.x != nullptr);
         GGML_ASSERT(diffusion_params.timesteps != nullptr);
+        unet.set_freeu(diffusion_params.freeu_enabled,
+                       diffusion_params.freeu_b1,
+                       diffusion_params.freeu_b2,
+                       diffusion_params.freeu_s1,
+                       diffusion_params.freeu_s2);
         const auto* extra = diffusion_extra_as<UNetDiffusionExtra>(diffusion_params);
         static const std::vector<sd::Tensor<float>> empty_controls;
         return compute(n_threads,
